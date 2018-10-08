@@ -16,7 +16,10 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -126,6 +129,9 @@ type File struct {
 
 	trimPrefix  string
 	lineComment bool
+
+	// decls are the package imports. key is base package or renamed package, value is import path.
+	decls map[string]string
 }
 
 // Package represents a package
@@ -202,6 +208,7 @@ func (g *Generator) parsePackage(directory string, names []string, text interfac
 			lineComment:  g.lineComment,
 			source:       fileBytes,
 			tokenFileSet: fs,
+			decls:        map[string]string{},
 		})
 	}
 	if len(astFiles) == 0 {
@@ -234,6 +241,7 @@ func (pkg *Package) typeCheck(fs *token.FileSet, astFiles []*ast.File) {
 // generate produces the String method for the named type.
 func (g *Generator) generate(typeName string) {
 	injects := make([]InjectableInterface, 0, 100)
+
 	for _, file := range g.pkg.files {
 		// Set the state for this run of the walker.
 		file.typeName = typeName
@@ -249,7 +257,7 @@ func (g *Generator) generate(typeName string) {
 	}
 
 	for _, inject := range injects {
-		g.writeinject(inject)
+		g.writeInject(inject)
 	}
 }
 
@@ -293,7 +301,15 @@ func (meth InjectableMethod) Call() string {
 
 }
 
-func (g *Generator) writeinject(inject InjectableInterface) {
+func (g *Generator) writeInject(inject InjectableInterface) {
+	if len(inject.Imports) > 0 {
+		g.Printf("import (\n")
+		for _, importSpec := range inject.Imports {
+			g.Printf("%s\n", importSpec)
+		}
+		g.Printf(")\n\n")
+	}
+
 	g.Printf("type Inject%s struct {\n", inject.Name)
 
 	for _, method := range inject.Methods {
@@ -343,6 +359,7 @@ type Value struct {
 type InjectableInterface struct {
 	Name    string
 	Methods []InjectableMethod
+	Imports []string
 }
 
 // InjectableMethod describes a method in an interface that is to be injected
@@ -363,8 +380,45 @@ func (v *Value) String() string {
 	return v.str
 }
 
+type visitFn func(node ast.Node) ast.Visitor
+
+func (fn visitFn) Visit(node ast.Node) ast.Visitor {
+	return fn(node)
+}
+
+type selectorCollector struct {
+	selectors map[string]bool
+}
+
+func (sc *selectorCollector) Visit(node ast.Node) ast.Visitor {
+	if selectorExpr, ok := node.(*ast.SelectorExpr); ok {
+		sc.selectors[selectorExpr.X.(*ast.Ident).Name] = true
+	}
+	return sc
+}
+
 // genDecl processes one declaration clause.
 func (f *File) genDecl(node ast.Node) bool {
+	importDecl, ok := node.(*ast.ImportSpec)
+	if ok {
+		var importBuf bytes.Buffer
+		err := printer.Fprint(&importBuf, f.tokenFileSet, importDecl)
+		if err != nil {
+			log.Fatalf("failed printing %s", err)
+		}
+
+		if importDecl.Name != nil {
+			f.decls[importDecl.Name.Name] = importBuf.String()
+		}
+		ipath := strings.Trim(importDecl.Path.Value, `"`)
+		if ipath == "C" {
+			return false
+		}
+		local := importPathToNameGoPath(ipath, f.pkg.dir)
+		f.decls[local] = importBuf.String()
+		return false
+	}
+
 	interfaceTypeDecl, ok := node.(*ast.TypeSpec)
 	if !ok {
 		return true
@@ -378,6 +432,18 @@ func (f *File) genDecl(node ast.Node) bool {
 		return false // not an interface type
 	}
 	inject := InjectableInterface{Name: interfaceTypeDecl.Name.Name}
+
+	sc := &selectorCollector{map[string]bool{}}
+	ast.Walk(sc, interfaceTypeNode)
+
+	for k, _ := range sc.selectors {
+		importSpec, ok := f.decls[k]
+		if !ok {
+			continue
+		}
+
+		inject.Imports = append(inject.Imports, importSpec)
+	}
 
 	for _, method := range interfaceTypeNode.Methods.List {
 		methodInject := InjectableMethod{Name: method.Names[0].Name}
@@ -448,4 +514,87 @@ func (f *File) genDecl(node ast.Node) bool {
 
 func defaultImporter() types.Importer {
 	return importer.For("source", nil)
+}
+
+// From imports////////////////
+
+// importPathToNameGoPath finds out the actual package name, as declared in its .go files.
+// If there's a problem, it falls back to using importPathToNameBasic.
+func importPathToNameGoPath(importPath, srcDir string) (packageName string) {
+	pkgName, err := importPathToNameGoPathParse(importPath, srcDir)
+	if err == nil {
+		return pkgName
+	}
+	return importPathToNameBasic(importPath, srcDir)
+}
+
+// importPathToNameBasic assumes the package name is the base of import path,
+// except that if the path ends in foo/vN, it assumes the package name is foo.
+func importPathToNameBasic(importPath, srcDir string) (packageName string) {
+	base := path.Base(importPath)
+	if strings.HasPrefix(base, "v") {
+		if _, err := strconv.Atoi(base[1:]); err == nil {
+			dir := path.Dir(importPath)
+			if dir != "." {
+				return path.Base(dir)
+			}
+		}
+	}
+	return base
+}
+
+// importPathToNameGoPathParse is a faster version of build.Import if
+// the only thing desired is the package name. It uses build.FindOnly
+// to find the directory and then only parses one file in the package,
+// trusting that the files in the directory are consistent.
+func importPathToNameGoPathParse(importPath, srcDir string) (packageName string, err error) {
+	buildPkg, err := build.Import(importPath, srcDir, build.FindOnly)
+	if err != nil {
+		return "", err
+	}
+	d, err := os.Open(buildPkg.Dir)
+	if err != nil {
+		return "", err
+	}
+	names, err := d.Readdirnames(-1)
+	d.Close()
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(names) // to have predictable behavior
+	var lastErr error
+	var nfile int
+	for _, name := range names {
+		if !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		nfile++
+		fullFile := filepath.Join(buildPkg.Dir, name)
+
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, fullFile, nil, parser.PackageClauseOnly)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		pkgName := f.Name.Name
+		if pkgName == "documentation" {
+			// Special case from go/build.ImportDir, not
+			// handled by ctx.MatchFile.
+			continue
+		}
+		if pkgName == "main" {
+			// Also skip package main, assuming it's a +build ignore generator or example.
+			// Since you can't import a package main anyway, there's no harm here.
+			continue
+		}
+		return pkgName, nil
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("no importable package found in %d Go files", nfile)
 }
