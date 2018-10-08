@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	//"github.com/kr/pretty"
 	"go/ast"
 	"go/build"
 	"go/format"
@@ -311,6 +310,7 @@ func (g *Generator) writeInject(inject InjectableInterface) {
 	}
 
 	g.Printf("type Inject%s struct {\n", inject.Name)
+	g.Printf("DefaultImplementation %s\n", inject.Name)
 
 	for _, method := range inject.Methods {
 		g.Printf("Inject%s func%s\n", method.Name, method.Signature())
@@ -319,11 +319,21 @@ func (g *Generator) writeInject(inject InjectableInterface) {
 	g.Printf("}\n")
 
 	for _, method := range inject.Methods {
+		g.Printf("// %s calls the injected function for %s if it exists, or the default implementation's\n", method.Name, method.Name)
 		g.Printf("func (inject *Inject%s) %s%s{\n", inject.Name, method.Name, method.Signature())
+		g.Printf("if inject.Inject%s != nil {\n", method.Name)
 		if len(method.OutValues) > 0 {
-			g.Printf("return ")
+			g.Printf("return inject.Inject%s(%s)\n", method.Name, method.Call())
+		} else {
+			g.Printf("inject.Inject%s(%s)\nreturn\n", method.Name, method.Call())
 		}
-		g.Printf("inject.Inject%s(%s)", method.Name, method.Call())
+
+		g.Printf("}\n")
+		if len(method.OutValues) > 0 {
+			g.Printf("return inject.DefaultImplementation.%s(%s)\n", method.Name, method.Call())
+		} else {
+			g.Printf("inject.DefaultImplementation.%s(%s)\nreturn\n", method.Name, method.Call())
+		}
 		g.Printf("}\n\n")
 	}
 
