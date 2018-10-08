@@ -1,12 +1,15 @@
 # injector
 
-## Generate a usable
+### Use code generation to create a mock implementation of any interface
 
-### Usage
+#### Usage
 
 Install:
 
-`go get -u github.com/mpobrien/injector`
+```
+$ go get -u github.com/mpobrien/injector
+$ export PATH="$PATH:$GOPATH/bin"
+```
 
 Let's say you have some interface in your code, like:
 
@@ -22,7 +25,7 @@ For example, you may want to test that your code properly handles when an error 
 To generate a mock implementation, add a comment near the type:
 `//go:generate inject -type=ThingDoer`
 
-This will generate a mock implemenation into `thingdoer_inject.go`.
+This will write a mock implementation to `thingdoer_inject.go`.
 In your test code, you can now do:
 
 ```go
